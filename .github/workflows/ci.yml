@@ -12,6 +12,7 @@ jobs:
   # Install the MIMICK CLI, flash the build's images onto the bench and run
   # the tests -- one job, so every step runs on the same machine.
   test:
+    # needs: build
     runs-on: ubuntu-latest
 
     # # One PR on the bench at a time; keep in step with MIMICK_BENCH.
@@ -25,6 +26,8 @@ jobs:
       MIMICK_BENCH: mimick10
 
     steps:
+      # - name: Checkout code
+      #   uses: actions/checkout@v4
 
       # The downloads endpoint returns metadata for the latest CLI release;
       # take the linux-amd64 tarball from it.
@@ -64,14 +67,42 @@ jobs:
             *) echo "ERROR: expected MIMICK CLI $MIMICK_CLI_VERSION, got '$installed'" >&2; exit 1 ;;
           esac
 
-      # TODO: confirm the login flags against `mimick auth login --help`.
+      # `mimick auth login` only supports a browser sign-in, so drive one with
+      # Playwright (see .github/scripts/mimick-login.js).
+      - name: Install Playwright
+        run: npm install --no-save playwright@1.48.2
+
       - name: MIMICK login
         env:
           MIMICK_USERNAME: syamchandran.r@trenser.com
           MIMICK_PASSWORD: Tr3n53r@M
+          BROWSER: "true"   # stop xdg-open trying to find a browser
         run: |
-          mimick auth login
+          log="$RUNNER_TEMP/mimick-login.log"
+          timeout 120 mimick auth login > "$log" 2>&1 &
+          login_pid=$!
+
+          # Wait for the CLI to print its sign-in URL.
+          for _ in $(seq 1 30); do
+            MIMICK_LOGIN_URL=$(grep -oE 'https://[^ ]+/oauth/v2/authorize\?[^ ]+' "$log" | head -n 1)
+            [ -n "$MIMICK_LOGIN_URL" ] && break
+            sleep 1
+          done
+          [ -n "$MIMICK_LOGIN_URL" ] || { cat "$log"; echo "ERROR: no sign-in URL from mimick" >&2; exit 1; }
+
+          MIMICK_LOGIN_URL="$MIMICK_LOGIN_URL" SCREENSHOT_DIR="$RUNNER_TEMP" \
+            node .github/scripts/mimick-login.js || { cat "$log"; exit 1; }
+
+          wait "$login_pid" || { cat "$log"; echo "ERROR: mimick auth login failed" >&2; exit 1; }
           mimick auth status
+
+      - name: Upload sign-in screenshot
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mimick-login-failure
+          path: ${{ runner.temp }}/mimick-login-failure.png
+          if-no-files-found: ignore
 
       - name: Select MIMICK bench
         run: |
