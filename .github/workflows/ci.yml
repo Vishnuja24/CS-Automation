@@ -12,7 +12,6 @@ jobs:
   # Install the MIMICK CLI, flash the build's images onto the bench and run
   # the tests -- one job, so every step runs on the same machine.
   test:
-    needs: build
     runs-on: ubuntu-latest
 
     # # One PR on the bench at a time; keep in step with MIMICK_BENCH.
