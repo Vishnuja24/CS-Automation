@@ -26,8 +26,9 @@ jobs:
       MIMICK_BENCH: mimick10
 
     steps:
-      # - name: Checkout code
-      #   uses: actions/checkout@v4
+      # Needed for .github/scripts/mimick-login.js.
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       # The downloads endpoint returns metadata for the latest CLI release;
       # take the linux-amd64 tarball from it.
