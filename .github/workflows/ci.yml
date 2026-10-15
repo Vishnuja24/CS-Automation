@@ -70,7 +70,7 @@ jobs:
           MIMICK_USERNAME: syamchandran.r@trenser.com
           MIMICK_PASSWORD: Tr3n53r@M
         run: |
-          mimick auth login --username "$MIMICK_USERNAME" --password "$MIMICK_PASSWORD"
+          mimick auth login
           mimick auth status
 
       - name: Select MIMICK bench
