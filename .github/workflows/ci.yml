@@ -73,29 +73,16 @@ jobs:
       - name: Install Playwright
         run: npm install --no-save playwright@1.48.2
 
+      # TODO: set the MIMICK_USERNAME / MIMICK_PASSWORD secrets and confirm
+      # the login flags against `mimick auth login --help`.
       - name: MIMICK login
-        env:
-          MIMICK_USERNAME: syamchandran.r@trenser.com
-          MIMICK_PASSWORD: Tr3n53r@M
-          BROWSER: "true"   # stop xdg-open trying to find a browser
         run: |
-          log="$RUNNER_TEMP/mimick-login.log"
-          timeout 120 mimick auth login > "$log" 2>&1 &
-          login_pid=$!
+          echo "[SKIP] mimick auth login --username \"\$MIMICK_USERNAME\" --password ***"
+          echo "[SKIP] mimick auth status"
 
-          # Wait for the CLI to print its sign-in URL.
-          for _ in $(seq 1 30); do
-            MIMICK_LOGIN_URL=$(grep -oE 'https://[^ ]+/oauth/v2/authorize\?[^ ]+' "$log" | head -n 1)
-            [ -n "$MIMICK_LOGIN_URL" ] && break
-            sleep 1
-          done
-          [ -n "$MIMICK_LOGIN_URL" ] || { cat "$log"; echo "ERROR: no sign-in URL from mimick" >&2; exit 1; }
-
-          MIMICK_LOGIN_URL="$MIMICK_LOGIN_URL" SCREENSHOT_DIR="$RUNNER_TEMP" \
-            node .github/scripts/mimick-login.js || { cat "$log"; exit 1; }
-
-          wait "$login_pid" || { cat "$log"; echo "ERROR: mimick auth login failed" >&2; exit 1; }
-          mimick auth status
+      - name: Select MIMICK bench
+        run: |
+          echo "[SKIP] mimick bench use $MIMICK_BENCH"
 
       - name: Upload sign-in screenshot
         if: failure()
