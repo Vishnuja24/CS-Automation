@@ -19,7 +19,6 @@ name: Kernel Security Tracker
 #      (TODO: notify by email or other channel).
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
   schedule:
