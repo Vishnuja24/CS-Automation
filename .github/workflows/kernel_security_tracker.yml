@@ -1,0 +1,517 @@
+name: Kernel Security Tracker
+
+# Automates the kernel security update process (baseline: Ubuntu 26.04
+# "Resolute"). Every 2 weeks:
+#   1. List the Resolute kernel tags on Launchpad and compare the latest with
+#      KERNEL_TAG in kernel/Taskfile.yml.
+#   2. Starting from the latest tag, compare each tag with the one before it
+#      until a pair has CVE- commits (use the newer tag of that pair) or
+#      KERNEL_TAG is reached (no security update; keep KERNEL_TAG).
+#   3. Update KERNEL_TAG to the new tag and KERNEL_URL to Launchpad.
+#   4. Build the kernel packages and image.
+#   5. Flash images onto the Shield, run the integration tests and test
+#      upgrading a Shield on the old kernel with the new .deb packages
+#      (TODO: the MIMICK steps only echo their commands until login and the
+#      runbooks work).
+#   6. On success, open a PR with the new KERNEL_TAG and KERNEL_URL; a person
+#      reviews the PR and approves the release.
+#   7. Notify build, test and PR results on the run page
+#      (TODO: notify by email or other channel).
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # 6:00 AM UTC Mondays; the check job skips odd ISO weeks.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: 'Latest kernel tag to check back from (default: latest Launchpad tag)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Kernel tags are looked up here, and the build fetches the new tag from here.
+env:
+  LP_GIT: https://git.launchpad.net/~ubuntu-kernel/ubuntu/+source/linux/+git/resolute
+
+jobs:
+  # Is there a newer kernel tag with security fixes?
+  check:
+    runs-on: ubuntu-latest
+
+    outputs:
+      update: ${{ steps.branch.outputs.update }}
+      current_tag: ${{ steps.check.outputs.current_tag }}
+      new_tag: ${{ steps.check.outputs.new_tag }}
+      branch: ${{ steps.branch.outputs.branch }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      # GitHub cron cannot express "every 2 weeks": run weekly and skip odd
+      # ISO weeks. Manual runs always check.
+      - name: Check schedule
+        id: schedule
+        run: |
+          week=$((10#$(date +%V)))
+          if [ "${{ github.event_name }}" = "schedule" ] && [ $((week % 2)) -ne 0 ]; then
+            echo "ISO week $week is odd, skipping (runs every 2 weeks)"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Find the newest tag after KERNEL_TAG that contains CVE fixes.
+      - name: Look for a kernel tag with security fixes
+        id: check
+        if: steps.schedule.outputs.run == 'true'
+        env:
+          KERNEL_TAG_INPUT: ${{ inputs.kernel_tag }}
+        run: |
+          set -euo pipefail
+
+          # current_tag=$(sed -n "s/^  KERNEL_TAG: '\(.*\)'$/\1/p" kernel/Taskfile.yml)
+          # [ -n "$current_tag" ] \
+          #   || { echo "ERROR: KERNEL_TAG not found in kernel/Taskfile.yml" >&2; exit 1; }
+          current_tag="Ubuntu-7.0.0-31.31"
+          echo "current_tag=$current_tag" >> "$GITHUB_OUTPUT"
+
+          # List the tags of KERNEL_TAG's kernel version (e.g.
+          # Ubuntu-7.0.0-*), oldest first, and take the latest -- or the tag
+          # given to a manual run.
+          # Launchpad's git server sometimes times out (HTTP 504); retry.
+          retry() {
+            for n in 1 2 3 4; do
+              "$@" && return 0
+              [ "$n" -lt 4 ] || break
+              echo "Launchpad request failed (attempt $n/4), retrying in $((n * 30))s" >&2
+              sleep $((n * 30))
+            done
+            echo "ERROR: Launchpad request failed after 4 attempts: $*" >&2
+            return 1
+          }
+
+          prefix=${current_tag%-*}-
+          refs=$(retry git ls-remote --tags --refs "$LP_GIT" "refs/tags/${prefix}*")
+          mapfile -t tags < <(sed 's|.*refs/tags/||' <<<"$refs" \
+            | grep -E "^${prefix//./\\.}[0-9]+\.[0-9]+$" | sort -V)
+          [ "${#tags[@]}" -gt 0 ] || { echo "ERROR: no ${prefix}* tags in $LP_GIT" >&2; exit 1; }
+          latest_tag=${KERNEL_TAG_INPUT:-${tags[-1]}}
+          echo "Current: $current_tag"
+          echo "Latest:  $latest_tag"
+
+          # Positions of the current and latest tags in the list.
+          cur=-1; last=-1
+          for i in "${!tags[@]}"; do
+            [ "${tags[$i]}" != "$current_tag" ] || cur=$i
+            [ "${tags[$i]}" != "$latest_tag" ] || last=$i
+          done
+          [ "$cur" -ge 0 ] || { echo "ERROR: $current_tag not found in $LP_GIT" >&2; exit 1; }
+          [ "$last" -ge 0 ] || { echo "ERROR: $latest_tag not found in $LP_GIT" >&2; exit 1; }
+          if [ "$last" -le "$cur" ]; then
+            echo "$current_tag is up to date"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Commits only (no trees or blobs) are enough for git log.
+          repo="$RUNNER_TEMP/resolute.git"
+          retry git clone -q --bare --filter=tree:0 "$LP_GIT" "$repo"
+
+          # Starting from the latest tag, compare each tag with the one before
+          # it until a pair has CVE- commits or the current tag is reached.
+          new_tag=""
+          for ((i = last; i > cur; i--)); do
+            prev=${tags[$((i - 1))]}
+            echo "git log --oneline --grep=\"CVE-\" $prev..${tags[$i]}"
+            commits=$(git -C "$repo" log --oneline --grep="CVE-" "$prev..${tags[$i]}")
+            if [ -n "$commits" ]; then
+              echo "$commits"
+              echo "CVE commits found -> use ${tags[$i]}"
+              new_tag=${tags[$i]}
+              break
+            fi
+            echo "No CVE commits found -> go back"
+          done
+
+          if [ -z "$new_tag" ]; then
+            echo "Reached $current_tag, no CVE- commits found; keeping $current_tag"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+          echo "update=true" >> "$GITHUB_OUTPUT"
+
+      # A kernel-security/<tag> branch means that tag is already in review.
+      - name: Skip if already proposed
+        id: branch
+        if: steps.check.outputs.update == 'true'
+        env:
+          NEW_TAG: ${{ steps.check.outputs.new_tag }}
+        run: |
+          branch="kernel-security/$NEW_TAG"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "Branch $branch already exists, skipping"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "update=true" >> "$GITHUB_OUTPUT"
+            echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          fi
+
+  # # Build the kernel packages and image with the new KERNEL_TAG.
+  # build:
+  #   needs: check
+  #   if: needs.check.outputs.update == 'true'
+  #   runs-on: owrt-large-runner-16c-64g-600g
+
+  #   # The build chroots and mounts on the runner, so only one build runs on
+  #   # it at a time. Shared with ci.yml, weekly_release.yml and
+  #   # publish_artifacts.yml.
+  #   concurrency:
+  #     group: owrt-large-runner-build
+  #     cancel-in-progress: false
+
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v5
+
+  #     # The new tag is from Launchpad, so fetch the kernel source from there.
+  #     - name: Update KERNEL_TAG and KERNEL_URL
+  #       env:
+  #         NEW_TAG: ${{ needs.check.outputs.new_tag }}
+  #       run: |
+  #         sed -i -e "s|^  KERNEL_TAG: '.*'$|  KERNEL_TAG: '$NEW_TAG'|" \
+  #                -e "s|^  KERNEL_URL: '.*'$|  KERNEL_URL: '$LP_GIT'|" kernel/Taskfile.yml
+  #         grep -qF "  KERNEL_TAG: '$NEW_TAG'" kernel/Taskfile.yml \
+  #           || { echo "ERROR: KERNEL_TAG not updated in kernel/Taskfile.yml" >&2; exit 1; }
+  #         grep -qF "  KERNEL_URL: '$LP_GIT'" kernel/Taskfile.yml \
+  #           || { echo "ERROR: KERNEL_URL not updated in kernel/Taskfile.yml" >&2; exit 1; }
+  #         git diff
+
+  #     - name: Install Nix
+  #       uses: cachix/install-nix-action@v31
+
+  #     - name: Use devenv binary cache
+  #       uses: cachix/cachix-action@v16
+  #       with:
+  #         name: devenv
+
+  #     - name: Install devenv.sh
+  #       run: nix profile add nixpkgs#devenv
+
+  #     # TODO: placeholder -- set the secret name and destination once the
+  #     # shield-archive-keyring package exists under packaging/.
+  #     - name: Add GPG public key for the apt repository
+  #       env:
+  #         REPO_GPG_PUBLIC_KEY: ${{ secrets.shield-archive-keyring.gpg }}
+  #         REPO_GPG_PUBLIC_KEY_DEST: packaging/shield-archive-keyring/files/shield-archive-keyring.gpg
+  #       run: |
+  #         mkdir -p "$(dirname "$REPO_GPG_PUBLIC_KEY_DEST")"
+  #         echo "$REPO_GPG_PUBLIC_KEY" > "$REPO_GPG_PUBLIC_KEY_DEST"
+  #         chmod 644 "$REPO_GPG_PUBLIC_KEY_DEST"
+
+  #     # Builds the kernel .debs (task kernel) and the image (task image).
+  #     - name: Build kernel and image
+  #       shell: devenv shell bash -- -e {0}
+  #       run: |
+  #         task ci
+
+  #     - name: Save images
+  #       uses: actions/upload-artifact@v5
+  #       with:
+  #         name: shield-ubuntu-images
+  #         path: |
+  #           image/bin/kform-shield-v1r5-d1d8-bootloader.img
+  #           image/bin/kform-shield-v1r5-d4-bootloader.img
+  #           image/bin/kform-shield-v1r5-kernel.img
+  #           image/bin/kform-shield-v1r5-ubuntu-rootfs.ext4
+  #           image/bin/cidata.img
+  #         if-no-files-found: error
+
+  #     # For the .deb upgrade test.
+  #     - name: Save kernel packages
+  #       uses: actions/upload-artifact@v5
+  #       with:
+  #         name: shield-kernel-debs
+  #         path: kernel/artifacts/deb/shield/*.deb
+  #         if-no-files-found: error
+
+  # # TODO: Flash the Shield, run the integration tests and test the .deb upgrade.
+  # test:
+  #   needs: [check, build]
+  #   runs-on: ubuntu-latest
+
+  #   # Shares the bench with ci.yml; keep in step with MIMICK_BENCH.
+  #   concurrency:
+  #     group: mimick-bench-mimick10
+  #     cancel-in-progress: false
+
+  #   env:
+  #     MIMICK_DOWNLOADS_URL: https://api.mimick.cloud/api/v1/downloads/mimick
+  #     MIMICK_PLATFORM: linux-amd64
+  #     MIMICK_BENCH: mimick10
+
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v5
+
+  #     # The downloads endpoint returns metadata for the latest CLI release;
+  #     # take the linux-amd64 tarball from it.
+  #     - name: Download MIMICK CLI
+  #       id: mimick_cli
+  #       run: |
+  #         meta=$(curl -fsSL "$MIMICK_DOWNLOADS_URL")
+  #         [ "$(jq -r '.released' <<<"$meta")" = "true" ] \
+  #           || { echo "ERROR: latest MIMICK CLI is not released" >&2; exit 1; }
+
+  #         version=$(jq -r '.version' <<<"$meta")
+  #         platform=$(jq -c --arg p "$MIMICK_PLATFORM" '.platforms[] | select(.platform == $p)' <<<"$meta")
+  #         [ -n "$platform" ] || { echo "ERROR: no $MIMICK_PLATFORM build in MIMICK metadata" >&2; exit 1; }
+  #         url=$(jq -r '.url' <<<"$platform")
+  #         filename=$(jq -r '.filename' <<<"$platform")
+  #         echo "MIMICK CLI $version: $url"
+
+  #         cd "$RUNNER_TEMP"
+  #         curl -fsSL "$url" -o "$filename"
+  #         echo "version=$version" >> "$GITHUB_OUTPUT"
+  #         echo "filename=$filename" >> "$GITHUB_OUTPUT"
+
+  #     - name: Install MIMICK CLI
+  #       working-directory: ${{ runner.temp }}
+  #       run: |
+  #         tar -xzf "${{ steps.mimick_cli.outputs.filename }}"
+  #         sudo mv mimick /usr/local/bin/
+
+  #     - name: Check MIMICK CLI version
+  #       env:
+  #         MIMICK_CLI_VERSION: ${{ steps.mimick_cli.outputs.version }}
+  #       run: |
+  #         installed=$(mimick --version)
+  #         echo "Installed MIMICK CLI: $installed"
+  #         case "$installed" in
+  #           *"$MIMICK_CLI_VERSION"*) echo "[OK] MIMICK CLI $MIMICK_CLI_VERSION" ;;
+  #           *) echo "ERROR: expected MIMICK CLI $MIMICK_CLI_VERSION, got '$installed'" >&2; exit 1 ;;
+  #         esac
+
+  #     # The MIMICK steps below are stubs: they only echo the command they will
+  #     # run, because login, the bench and the runbooks are not working yet.
+  #     # Replace each echo with the real command once they are.
+
+  #     # TODO: set the MIMICK_USERNAME / MIMICK_PASSWORD secrets and confirm
+  #     # the login flags against `mimick auth login --help`.
+  #     - name: MIMICK login
+  #       run: |
+  #         echo "[SKIP] mimick auth login --username \"\$MIMICK_USERNAME\" --password ***"
+  #         echo "[SKIP] mimick auth status"
+
+  #     - name: Select MIMICK bench
+  #       run: |
+  #         echo "[SKIP] mimick bench use $MIMICK_BENCH"
+
+  #     - name: Download images
+  #       uses: actions/download-artifact@v5
+  #       with:
+  #         name: shield-ubuntu-images
+  #         path: artifacts/images/
+
+  #     - name: Download kernel packages
+  #       uses: actions/download-artifact@v5
+  #       with:
+  #         name: shield-kernel-debs
+  #         path: artifacts/debs/
+
+  #     - name: Flash images
+  #       working-directory: artifacts/images
+  #       run: |
+  #         echo "[SKIP] mimick runbook run \"Flash Shield (Ubuntu)\""
+  #         echo "         -p BOOTLOADER=./kform-shield-v1r5-d4-bootloader.img"
+  #         echo "         -p KERNEL=./kform-shield-v1r5-kernel.img"
+  #         echo "         -p ROOTFS=./kform-shield-v1r5-ubuntu-rootfs.ext4"
+  #         echo "         -p CIDATA=./cidata.img"
+
+  #     # TODO: confirm the runbook names and add -p parameters if any need them.
+  #     - name: Run integration tests
+  #       run: |
+  #         for runbook in \
+  #           "Shield Integration - UI (Ubuntu)" \
+  #           "Shield Integration - Cell (Ubuntu)" \
+  #           "Shield Integration - Ethernet (Ubuntu)" \
+  #           "Shield Integration - SOM-Base (Ubuntu)" \
+  #           "Shield Integration - WiFi (Ubuntu)"; do
+  #           echo "[SKIP] mimick runbook run \"$runbook\""
+  #         done
+
+  #     # TODO: the runbook must flash the image from the current KERNEL_TAG
+  #     # (e.g. the latest release), install the new .debs with apt, reboot,
+  #     # and check that the boot entry and `uname -r` show the new kernel.
+  #     - name: Test .deb upgrade from the current kernel
+  #       working-directory: artifacts/debs
+  #       env:
+  #         CURRENT_TAG: ${{ needs.check.outputs.current_tag }}
+  #         NEW_TAG: ${{ needs.check.outputs.new_tag }}
+  #       run: |
+  #         echo "[SKIP] mimick runbook run \"Shield Kernel Deb Upgrade (Ubuntu)\""
+  #         echo "         -p FROM_KERNEL_TAG=$CURRENT_TAG"
+  #         echo "         -p TO_KERNEL_TAG=$NEW_TAG"
+  #         echo "         -p DEBS=."
+
+  # # After the build and tests pass, push kernel-security/<tag> with the new
+  # # KERNEL_TAG and KERNEL_URL and open a PR. A person reviews the PR and
+  # # approves the release.
+  # open-pr:
+  #   needs: [check, test]
+  #   runs-on: ubuntu-latest
+
+  #   permissions:
+  #     contents: write
+  #     pull-requests: write
+
+  #   outputs:
+  #     url: ${{ steps.pr.outputs.url }}
+
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v5
+
+  #     # Same edit the build job made before building.
+  #     - name: Push branch
+  #       env:
+  #         CURRENT_TAG: ${{ needs.check.outputs.current_tag }}
+  #         NEW_TAG: ${{ needs.check.outputs.new_tag }}
+  #         BRANCH: ${{ needs.check.outputs.branch }}
+  #       run: |
+  #         sed -i -e "s|^  KERNEL_TAG: '.*'$|  KERNEL_TAG: '$NEW_TAG'|" \
+  #                -e "s|^  KERNEL_URL: '.*'$|  KERNEL_URL: '$LP_GIT'|" kernel/Taskfile.yml
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "github-actions[bot]@users.noreply.github.com"
+  #         git switch -c "$BRANCH"
+  #         git commit -am "kernel: update to $NEW_TAG for security fixes" \
+  #           -m "Moves KERNEL_TAG from $CURRENT_TAG to $NEW_TAG and KERNEL_URL to $LP_GIT."
+  #         git push origin "$BRANCH"
+
+  #     - name: Open pull request
+  #       id: pr
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #         CURRENT_TAG: ${{ needs.check.outputs.current_tag }}
+  #         NEW_TAG: ${{ needs.check.outputs.new_tag }}
+  #         BRANCH: ${{ needs.check.outputs.branch }}
+  #         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #       run: |
+  #         {
+  #           echo "Moves \`KERNEL_TAG\` from \`$CURRENT_TAG\` to \`$NEW_TAG\`, the newest Ubuntu Resolute kernel tag with CVE fixes, and \`KERNEL_URL\` to \`$LP_GIT\`."
+  #           echo ""
+  #           echo "Built and tested in $RUN_URL"
+  #         } > pr-body.md
+
+  #         url=$(gh pr create --base main --head "$BRANCH" \
+  #           --title "kernel: update to $NEW_TAG for security fixes" \
+  #           --body-file pr-body.md)
+  #         echo "url=$url" >> "$GITHUB_OUTPUT"
+
+  # # Notify whether the build, tests and PR passed or failed: an annotation on
+  # # the run and a line in its summary page.
+  # notify:
+  #   needs: [check, build, test, open-pr]
+  #   if: always() && needs.build.result != 'skipped'
+  #   runs-on: ubuntu-latest
+
+  #   steps:
+  #     - name: Report result
+  #       env:
+  #         CURRENT_TAG: ${{ needs.check.outputs.current_tag }}
+  #         NEW_TAG: ${{ needs.check.outputs.new_tag }}
+  #         BUILD_RESULT: ${{ needs.build.result }}
+  #         TEST_RESULT: ${{ needs.test.result }}
+  #         PR_RESULT: ${{ needs.open-pr.result }}
+  #         PR_URL: ${{ needs.open-pr.outputs.url }}
+  #         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #       run: |
+  #         # A job is skipped when the one before it fails.
+  #         msg="Kernel $NEW_TAG: build $BUILD_RESULT, test $TEST_RESULT, PR $PR_RESULT (current KERNEL_TAG: $CURRENT_TAG)."
+  #         if [ "$PR_RESULT" = "success" ]; then
+  #           msg="$msg Review and approve the PR: $PR_URL"
+  #           echo "::notice title=Kernel security update::$msg"
+  #         else
+  #           msg="$msg Logs: $RUN_URL"
+  #           echo "::error title=Kernel security update::$msg"
+  #         fi
+  #         echo "### $msg" >> "$GITHUB_STEP_SUMMARY"
+
+  # Handles email notifications based on check results
+  notify:
+    needs: [check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # 1. New security tag found
+      - name: Send Mail - New Tag Found
+        if: needs.check.outputs.update == 'true' && needs.check.result == 'success'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.NOTIFY_RECIPIENT }}
+          from: "CI Build Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject: "🛡️ NEW KERNEL TAG FOUND: ${{ needs.check.outputs.new_tag }}"
+          html_body: |
+            <h2>New Kernel Security Tag Found</h2>
+            <p>A new kernel security update has been found for repository <b>${{ github.repository }}</b>.</p>
+            <ul>
+              <li><b>Current Tag:</b> ${{ needs.check.outputs.current_tag }}</li>
+              <li><b>New Tag:</b> ${{ needs.check.outputs.new_tag }}</li>
+              <li><b>Proposed Branch:</b> ${{ needs.check.outputs.branch }}</li>
+            </ul>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Workflow Run</a></p>
+
+      # 2. No new security tags / up to date
+      - name: Send Mail - No Update Needed
+        if: needs.check.outputs.update == 'false' && needs.check.result == 'success'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.NOTIFY_RECIPIENT }}
+          from: "CI Build Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject: "✅ Kernel Up to Date (${{ needs.check.outputs.current_tag }})"
+          html_body: |
+            <h2>No Security Updates Found</h2>
+            <p>The kernel check completed and no newer tags with CVE fixes were identified.</p>
+            <ul>
+              <li><b>Current Tag:</b> ${{ needs.check.outputs.current_tag }}</li>
+              <li><b>Status:</b> Up to date</li>
+            </ul>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Workflow Run</a></p>
+
+      # 3. Check job failure
+      - name: Send Mail - Check Job Failed
+        if: needs.check.result == 'failure'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.NOTIFY_RECIPIENT }}
+          from: "CI Build Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject: "🚨 FAILURE: Kernel Check Job Failed"
+          html_body: |
+            <h2>Check Job Execution Failed</h2>
+            <p>An error occurred while checking kernel tags in repository <b>${{ github.repository }}</b>.</p>
+            <ul>
+              <li><b>Triggered By:</b> ${{ github.actor }}</li>
+              <li><b>Ref / Branch:</b> ${{ github.ref_name }}</li>
+            </ul>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">Inspect Logs</a></p>
