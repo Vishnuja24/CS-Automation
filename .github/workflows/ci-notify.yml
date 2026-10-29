@@ -1,0 +1,69 @@
+name: Build, Test and Notify
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Replace this step with your actual build/test commands
+      - name: Execute Job Tasks
+        run: |
+          echo "Running build tasks..."
+          # Simulating work
+          sleep 2
+          echo "Job finished successfully!"
+
+      # Step A: Runs ONLY when all preceding steps succeed
+      - name: Send Mail on Job Success
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.NOTIFY_RECIPIENT }}
+          from: "CI Build Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject: "✅ SUCCESS: Job succeeded in ${{ github.repository }} (${{ github.ref_name }})"
+          html_body: |
+            <h2>Pipeline Succeeded</h2>
+            <p>The job in repository <b>${{ github.repository }}</b> finished successfully.</p>
+            <ul>
+              <li><b>Branch:</b> ${{ github.ref_name }}</li>
+              <li><b>Commit:</b> ${{ github.sha }}</li>
+              <li><b>Triggered By:</b> ${{ github.actor }}</li>
+            </ul>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Full Run Logs</a></p>
+
+      # Step B: Runs ONLY if any preceding step fails
+      - name: Send Mail on Job Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.NOTIFY_RECIPIENT }}
+          from: "CI Build Bot <${{ secrets.MAIL_USERNAME }}>"
+          subject: "🚨 FAILURE: Job failed in ${{ github.repository }} (${{ github.ref_name }})"
+          html_body: |
+            <h2>Pipeline Failed</h2>
+            <p>A failure occurred during job execution in <b>${{ github.repository }}</b>.</p>
+            <ul>
+              <li><b>Branch:</b> ${{ github.ref_name }}</li>
+              <li><b>Commit:</b> ${{ github.sha }}</li>
+              <li><b>Committed By:</b> ${{ github.actor }}</li>
+            </ul>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">Investigate Failure Logs</a></p>
