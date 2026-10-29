@@ -1,0 +1,51 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run build & tests
+        run: |
+          npm ci
+          npm test
+
+      # Runs ONLY if any previous step failed
+      - name: Notify on Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "🚨 Pipeline Failed: ${{ github.repository }} (${{ github.ref_name }})"
+          to: recipient@example.com
+          from: GitHub Actions <ci-alerts@example.com>
+          body: |
+            Job failed on commit ${{ github.sha }}.
+            Author: ${{ github.actor }}
+            View run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # Runs ONLY if all previous steps succeeded
+      - name: Notify on Success
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "✅ Pipeline Succeeded: ${{ github.repository }} (${{ github.ref_name }})"
+          to: recipient@example.com
+          from: GitHub Actions <ci-alerts@example.com>
+          body: |
+            Build passed successfully!
+            View run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
